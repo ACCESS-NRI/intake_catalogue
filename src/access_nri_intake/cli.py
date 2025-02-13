@@ -18,6 +18,9 @@ from intake import open_esm_datastore
 from .catalog import EXP_JSONSCHEMA, translators
 from .catalog.manager import CatalogManager
 from .data import CATALOG_NAME_FORMAT
+from .experiment import use_datastore
+from .experiment.main import scaffold_catalog_entry as _scaffold_catalog_entry
+from .experiment.utils import parse_kwargs, validate_args
 from .source import builders
 from .utils import _can_be_array, get_catalog_fp, load_metadata_yaml
 
@@ -475,10 +478,95 @@ def build(argv: Sequence[str] | None = None):
         raise RuntimeError(f"Catalog save failed: {str(e)}")
 
     if update:
+        cat_loc = get_catalog_fp(basepath=catalog_base_path)
+        existing_cat = Path(cat_loc).exists()
 
-        yaml_dict = _compute_previous_versions(
-            yaml_dict, catalog_base_path, build_base_path, version
-        )
+        # See if there's an existing catalog
+        if existing_cat:
+            with Path(cat_loc).open(mode="r") as fobj:
+                yaml_old = yaml.safe_load(fobj)
+
+            # Check to see what has changed. We care if the following keys
+            # have changed (ignoring the sources.access_nri at the head
+            # of each dict path):
+            # - args (all parts - mode should never change)
+            # - driver
+            # If these have changed, we need to move the old catalog aside,
+            # labelled with its min and max version numbers
+            # The exception to this rule is if the old catalog doesn't have
+            # a min or max version - this makes it likely to be an old-style
+            # catalog, so we'll need to grab its storage flags, but we don't
+            # want to save it (we assume all existing catalog versions are
+            # compatible with the new one).
+
+            args_new, args_old = (
+                yaml_dict["sources"]["access_nri"]["args"],
+                yaml_old["sources"]["access_nri"]["args"],
+            )
+            driver_new, driver_old = (
+                yaml_dict["sources"]["access_nri"]["driver"],
+                yaml_old["sources"]["access_nri"]["driver"],
+            )
+            vmin_old, vmax_old = (
+                yaml_old["sources"]["access_nri"]["parameters"]["version"].get("min"),
+                yaml_old["sources"]["access_nri"]["parameters"]["version"].get("max"),
+            )
+            storage_new, storage_old = (
+                yaml_dict["sources"]["access_nri"]["metadata"]["storage"],
+                yaml_old["sources"]["access_nri"]["metadata"]["storage"],
+            )
+
+            if (
+                (args_new != args_old or driver_new != driver_old)
+                and vmin_old is not None
+                and vmax_old is not None
+            ):
+                # Move the old catalog out of the way
+                # New catalog.yaml will have restricted version bounds
+                if vmin_old == vmax_old:
+                    vers_str = vmin_old
+                else:
+                    vers_str = f"{vmin_old}-{vmax_old}"
+                Path(cat_loc).rename(Path(cat_loc).parent / f"catalog-{vers_str}.yaml")
+                yaml_dict = _set_catalog_yaml_version_bounds(
+                    yaml_dict, version, version
+                )
+            elif storage_new != storage_old:
+                yaml_dict["sources"]["access_nri"]["metadata"]["storage"] = (
+                    _combine_storage_flags(storage_new, storage_old)
+                )
+
+            # Set the minimum and maximum catalog versions, if they're not set already
+            # in the 'new catalog' if statement above
+            if (
+                yaml_dict["sources"]["access_nri"]["parameters"]["version"].get("min")
+                is None
+            ):
+                yaml_dict = _set_catalog_yaml_version_bounds(
+                    yaml_dict,
+                    min(version, vmin_old if vmin_old is not None else version),
+                    max(version, vmax_old if vmax_old is not None else version),
+                )
+
+        if (not existing_cat) or (vmin_old is None and vmax_old is None):
+            # No existing catalog, so set min = max = current version,
+            # unless there are folders with the right names in the write
+            # directory
+            existing_vers = [
+                v.name
+                for v in build_base_path.iterdir()
+                if re.match(CATALOG_NAME_FORMAT, v.name)
+            ]
+            if len(existing_vers) > 0:
+                yaml_dict = _set_catalog_yaml_version_bounds(
+                    yaml_dict,
+                    min(min(existing_vers), version),
+                    max(max(existing_vers), version),
+                )
+            else:
+                yaml_dict = _set_catalog_yaml_version_bounds(
+                    yaml_dict, version, version
+                )
 
         with Path(get_catalog_fp(basepath=catalog_base_path)).open(mode="w") as fobj:
             yaml.dump(yaml_dict, fobj)
@@ -573,3 +661,147 @@ def metadata_template(loc: str | Path | None = None) -> None:
 
     with open((Path(loc) / "metadata.yaml"), "w") as outfile:
         yaml.dump(template, outfile, default_flow_style=False, sort_keys=False)
+
+
+def use_esm_datastore(argv: Sequence[str] | None = None) -> int:
+    """
+    Either creates, verifies, or updates the intake-esm datastore
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build an esm-datastore by inspecting a directory containing model outputs."
+            " If no datastore exists, a new one will be created. If a datastore exists,"
+            " its integrity will be verified, and the datastore regenerated if necessary."
+        )
+    )
+    parser.add_argument(
+        "--builder",
+        type=str,
+        help=(
+            "Builder to use to create the esm-datastore."
+            " Builders are defined the source.builders module. Currently available options are:"
+            f" {', '.join(builders.__all__)}."
+            " To build a datastore for a new model, please contact the ACCESS-NRI team."
+        ),
+        required=False,
+        # If we can, it would be nice to eventually relax this and try to automatically
+        # determine the builder if possible.
+    )
+
+    parser.add_argument(
+        "--builder-kwargs",
+        type=parse_kwargs,
+        nargs="*",
+        help=(
+            "Additional keyword arguments to pass to the builder."
+            " Should be in the form of key=value."
+        ),
+    )
+
+    parser.add_argument(
+        "--expt-dir",
+        type=str,
+        default="./",
+        help=(
+            "Directory containing the model outputs to be added to the esm-datastore."
+            " Defaults to the current working directory. Although builders support adding"
+            " multiple directories, this tool only supports one directory at a time - at present."
+        ),
+    )
+
+    parser.add_argument(
+        "--cat-dir",
+        type=str,
+        help=(
+            "Directory in which to place the catalog.json file."
+            " Defaults to the value of --expt-dir if not set."
+        ),
+    )
+
+    parser.add_argument(
+        "--datastore-name",
+        type=str,
+        help=(
+            "Name of the datastore to use. If not provided, this will default to"
+            " 'experiment_datastore'."
+        ),
+        default="experiment_datastore",
+    )
+
+    parser.add_argument(
+        "--description",
+        type=str,
+        help=(
+            "Description of the datastore. If not provided, a default description will be used:"
+            " 'esm_datastore for the model output in {--expt-dir}'"
+        ),
+        default=None,
+    )
+
+    args = parser.parse_args(argv)
+    builder = args.builder
+    experiment_dir = Path(args.expt_dir)
+    catalog_dir = Path(args.cat_dir) if args.cat_dir else experiment_dir
+    builder_kwargs = args.builder_kwargs or {}
+    datastore_name = args.datastore_name
+    description = args.description
+
+    try:
+        builder = getattr(builders, builder)
+    except AttributeError:
+        builder = object
+    except TypeError:
+        builder = None
+    finally:
+        if builder is None:
+            pass
+        elif not isinstance(builder, type) or not issubclass(builder, builders.Builder):
+            raise ValueError(
+                f"Builder {builder} is not a valid builder. Please choose from {builders.__all__}"
+            )
+
+    if not experiment_dir.exists():
+        raise FileNotFoundError(f"Directory {experiment_dir} does not exist.")
+    if not catalog_dir.exists():
+        raise FileNotFoundError(f"Directory {catalog_dir} does not exist.")
+
+    validate_args(builder, builder_kwargs)
+
+    use_datastore(
+        experiment_dir,
+        builder,
+        catalog_dir,
+        builder_kwargs=builder_kwargs,
+        datastore_name=datastore_name,
+        description=description,
+        open_ds=False,
+    )
+
+    return 0
+
+
+def scaffold_catalog_entry(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scaffold a catalog entry for an esm-datastore, by providing information"
+            " about how to integrate the datastore into the access-nri-intake catalog."
+        )
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        required=False,
+        help=(
+            "Instead of dumping all the information at once, provide it in chunks"
+            " and ask for confirmation after each chunk."
+        ),
+    )
+
+    args = parser.parse_args(argv)
+
+    interactive = args.interactive
+
+    _scaffold_catalog_entry(interactive)
+
+    return 0
